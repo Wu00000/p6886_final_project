@@ -1,0 +1,329 @@
+---
+title: "p6886_final_project"
+output: 
+  html_document:
+    toc: true
+author: "Qihang Wu"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.width = 6,
+  out.width = "80%",
+  fig.align = "center")
+
+library(tidyverse)
+library(readxl)
+library(gridExtra)
+library(here)
+library(skimr)
+library(corrplot)
+library(caret)
+library(earth)
+library(klaR)
+library(rpart)
+library(rpart.plot)
+library(gbm)
+library(ranger)
+library(pdp)
+library(pROC)
+
+select <- dplyr::select
+```
+
+## Data pre-process
+
+```{r}
+# Import data
+t2dm_dat_raw <- read_xlsx(here("./data/Type2Diabetes.xlsx"), 
+                          range = "Diabetes_Classification!A1:P391") %>% 
+  janitor::clean_names()
+
+# Data overview
+skimr::skim_without_charts(t2dm_dat_raw)
+
+# Data clean
+t2dm_dat <- t2dm_dat_raw %>% 
+  mutate(
+    diabetes = recode(diabetes, "No diabetes" = "no", "Diabetes" = "yes"),
+    across(c("gender", "diabetes"), as.factor, .names = "fc_{.col}")
+  ) %>% 
+  select(-c("patient_number", "gender", "diabetes"))
+
+# --- Split data ---
+set.seed(202412)
+trRow <- createDataPartition(t2dm_dat$fc_diabetes, p = .65, list = FALSE)
+
+## Train data
+t2dm_tr <- t2dm_dat[trRow, ]
+x_tr <- model.matrix(fc_diabetes ~., t2dm_tr)[, -1] # remove intercept
+y_tr <- t2dm_tr$fc_diabetes
+
+## Test data
+t2dm_ts <- t2dm_dat[-trRow, ]
+x_ts <- model.matrix(fc_diabetes ~., t2dm_ts)[, -1] # remove intercept
+y_ts <- t2dm_ts$fc_diabetes
+```
+
+## EDA
+
+```{r, out.width="52%"}
+# Correlation plot
+cor_mt <- cor(x_tr, use = "pairwise.complete.obs")
+eda_fig1 <- cor_mt %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Variable1") %>% 
+  pivot_longer(-Variable1, names_to = "Variable2", values_to = "Correlation") %>% 
+  mutate(Variable1 = factor(Variable1, levels = rownames(cor_mt)),
+         Variable2 = factor(Variable2, levels = rownames(cor_mt))) %>% 
+  filter(as.numeric(Variable1) <= as.numeric(Variable2)) %>% # only show half of corr matrix
+  ggplot(., aes(x = Variable1, y = Variable2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Correlation, 2)), color = "black", size = 2) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       limits = c(-1, 1), name = "Corr") +
+  coord_fixed() + theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+eda_fig1
+
+# Bar plot for gender
+eda_fig2 <- t2dm_tr %>% 
+  select(14:15) %>% 
+  group_by(fc_gender, fc_diabetes) %>% 
+  summarise(num = n(), .groups = "drop") %>% 
+  group_by(fc_gender) %>% 
+  mutate(percentage = (num / sum(num)) * 100) %>% 
+  ungroup() %>% 
+  ggplot(., aes(x = fc_gender, y = percentage, fill = fc_diabetes)) +
+  geom_col(position = "dodge") +
+  coord_flip() + theme_bw() +
+  labs(x = "Gender", y = "Percentage (%)", fill = "Diabetes Status")
+eda_fig2
+
+# Box plot for cholesterol ~ diabetes, stratified by gender
+eda_fig3 <- t2dm_tr %>% 
+  ggplot(., aes(x = fc_gender, y = cholesterol, fill = fc_diabetes)) +
+  geom_boxplot(position = position_dodge(width = .9)) +
+  theme_classic() +
+  labs(x = "Gender", y = "Total Cholesterol (mg/dL)", fill = "Diabetes Status")
+eda_fig3
+  
+# Box plot for all numerical vars
+eda_fig4 <- t2dm_tr %>% 
+  select(fc_diabetes, where(is.numeric)) %>% 
+  mutate(across(where(is.numeric), ~ as.numeric(scale(.)), .names = "{.col}")) %>%
+  pivot_longer(where(is.numeric), names_to = "Variable", values_to = "Value") %>% 
+  ggplot(., aes(x = Variable, y = Value, fill = fc_diabetes)) +
+  geom_boxplot(position = position_dodge(width = .8)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(x = "Numerical Variables", y = "Standardized Value", fill = "Diabetes Status")
+eda_fig4
+```
+
+## Model fitting
+### Logistic regression
+
+```{r}
+set.seed(202412)
+t2dm_lr_10cv <- train(x = x_tr, y = y_tr, method = "glm", family = binomial(link = "logit"),
+                      trControl = trainControl(method = "cv", number = 10, 
+                                               classProbs = TRUE, savePredictions = TRUE))
+t2dm_lr_10cv
+
+# Consider different thresholds
+prob_thresh <- seq(.1, .9, .1)
+t2dm_lr_ths_res <- thresholder(t2dm_lr_10cv, threshold = prob_thresh, final = TRUE,
+                               statistics = "all")
+t2dm_lr_ths_res
+```
+
+### Penalized logistic regression
+
+```{r}
+tg <- expand.grid(alpha = c(0, .5, 1),
+                  lambda = seq(.001, .1, length = 10))
+
+set.seed(202412)
+t2dm_penal_lr_10cv <- train(x = x_tr, y = y_tr, method = "glmnet", 
+                            family = "binomial", tuneGrid = tg,
+                            trControl = trainControl(method = "cv", number = 10))
+t2dm_penal_lr_10cv$results[which.max(t2dm_penal_lr_10cv$results$Accuracy), ]
+```
+
+### Linear Discriminant Analysis (LDA)
+
+```{r, out.width="60%"}
+# EDA for LDA: classification based on every combinations of two variables selected
+partimat(fc_diabetes ~ cholesterol + glucose + age + chol_hdl_ratio, 
+         data = t2dm_tr, method = "lda")
+
+set.seed(202412)
+t2dm_lda_10cv <- train(x = x_tr, y = y_tr, method = "lda", 
+                       trControl = trainControl(method = "cv", number = 10))
+t2dm_lda_10cv$results
+```
+
+### Naive Bayes
+
+```{r}
+set.seed(202412)
+t2dm_nb_10cv <- train(x = x_tr, y = y_tr, method = "naive_bayes",
+                      trControl = trainControl(method = "cv", number = 10))
+t2dm_nb_10cv$results
+```
+
+
+### Classification tree
+
+```{r}
+set.seed(202412)
+t2dm_ctree_10cv <- train(x = x_tr, y = y_tr, method = "rpart",
+                         parms = list(split = "gini"),
+                         control = rpart.control(minsplit = 20, minbucket = 1),
+                         tuneLength = 10, 
+                         trControl = trainControl(method = "cv", number = 10,
+                                                  classProbs = TRUE,
+                                                  selectionFunction = "oneSE"))
+t2dm_ctree_10cv
+
+# Plot the selected classification tree
+rpart.plot(t2dm_ctree_10cv$finalModel)
+
+t2dm_ctree_10cv$results[which.max(t2dm_ctree_10cv$results$Accuracy), ]
+```
+
+### Boosted classification tree
+
+```{r}
+tg_boostcl <- expand.grid(n.trees = c(200, 400, 600, 800),
+                          interaction.depth = 1:5,
+                          shrinkage = c(.0001, .001, .01, .1),
+                          n.minobsinnode = 10)
+
+set.seed(202412)
+t2dm_boostctree_10cv <- train(x = x_tr, y = y_tr, method = "gbm",
+                              bag.fraction = .5, tuneGrid = tg_boostcl,
+                              trControl = trainControl(method = "cv", number = 10), 
+                              verbose = FALSE)
+t2dm_boostctree_10cv$results[which.max(t2dm_boostctree_10cv$results$Accuracy), ]
+```
+
+### Random Forests
+
+```{r}
+set.seed(202412)
+t2dm_rf_10cv <- train(x = x_tr, y = y_tr, method = "ranger",
+                      tuneGrid = expand.grid(mtry = 1:10, splitrule = "gini",
+                                             min.node.size = seq(2, 12, 2)),
+                      trControl = trainControl(method = "cv", number = 10, 
+                                               classProbs = TRUE))
+t2dm_rf_10cv$results[which.max(t2dm_rf_10cv$results$Accuracy), ]
+```
+
+### SVM with linear kernel
+
+```{r}
+set.seed(202412)
+t2dm_svml_10cv <- train(x = x_tr, y = y_tr, method = "svmLinear",
+                        preProcess = c("center", "scale"),
+                        tuneGrid = data.frame(C = exp(seq(-5, 1, length = 30))),
+                        trControl = trainControl(method = "cv", number = 10, classProbs = TRUE))
+t2dm_svml_10cv$results[which.max(t2dm_svml_10cv$results$Accuracy), ]
+```
+
+
+## Results
+### Interpretation of black-box models
+#### Variable importance (VIP)
+
+```{r}
+# Obtain the best tuning parameters from the previous
+set.seed(202412)
+t2dm_rf_final <- ranger(fc_diabetes ~., data = t2dm_tr,
+                        mtry = t2dm_rf_10cv$bestTune$mtry,
+                        min.node.size = t2dm_rf_10cv$bestTune$min.node.size,
+                        splitrule = "gini", importance = "permutation",
+                        scale.permutation.importance = TRUE)
+
+barplot(sort(ranger::importance(t2dm_rf_final), decreasing = FALSE), 
+        las = 2, horiz = TRUE, cex.names = .7, col = colorRampPalette(colors = c("cyan", "blue"))(19),
+        cex.axis = .7, cex.main = .8,
+        main = "Variable Importance from Random Forests (ranger)")
+```
+
+#### Partial dependence plots (PDPs) & Individual conditional expectation (ICE) curves
+
+```{r, out.width="45%"}
+pdp_rf <- t2dm_rf_10cv %>% 
+  partial(pred.var = "glucose", grid.resolution = 100) %>% 
+  autoplot(train = t2dm_tr, rug = TRUE) +
+  theme_bw() +
+  ggtitle("PDP")
+
+ice_rf <- t2dm_rf_10cv %>% 
+  partial(pred.var = "glucose", grid.resolution = 100, ice = TRUE) %>% 
+  autoplot(train = t2dm_tr, alpha = .1) +
+  theme_bw() +
+  ggtitle("ICE, not centered")
+
+grid.arrange(pdp_rf, ice_rf, nrow = 1)
+```
+
+### Comparisons
+#### Summary of resampling performance
+
+```{r, out.width="50%"}
+res <- resamples(list(lr = t2dm_lr_10cv, penal_lr = t2dm_penal_lr_10cv,
+                      lda = t2dm_lda_10cv, nb = t2dm_nb_10cv,
+                      ctree = t2dm_ctree_10cv, boost_ctree = t2dm_boostctree_10cv,
+                      rf = t2dm_rf_10cv, svm_lin = t2dm_svml_10cv))
+
+summary(res)
+```
+
+#### Test data performance
+
+```{r, out.width="50%"}
+# Make predictions
+lr_pred <- predict(t2dm_lr_10cv, newdata = x_ts, type = "prob")[, 2]
+penal_lr_pred <- predict(t2dm_penal_lr_10cv, newdata = x_ts, type = "prob")[, 2]
+lda_pred <- predict(t2dm_lda_10cv, newdata = x_ts, type = "prob")[, 2]
+nb_pred <- predict(t2dm_nb_10cv, newdata = x_ts, type = "prob")[, 2]
+ctree_pred <- predict(t2dm_ctree_10cv, newdata = x_ts, type = "prob")[, 2]
+boost_ctree_pred <- predict(t2dm_boostctree_10cv, newdata = x_ts, type = "prob")[, 2]
+rf_pred <- predict(t2dm_rf_10cv, newdata = x_ts, type = "prob")[, 2]
+svm_lin_pred <- predict(t2dm_svml_10cv, newdata = x_ts, type = "prob")[, 2]
+
+roc_lr <- roc(y_ts, lr_pred)
+roc_penal_lr <- roc(y_ts, penal_lr_pred)
+roc_lda <- roc(y_ts, lda_pred)
+roc_nb <- roc(y_ts, nb_pred)
+roc_ctree <- roc(y_ts, ctree_pred)
+roc_boost_ctree <- roc(y_ts, boost_ctree_pred)
+roc_rf <- roc(y_ts, rf_pred)
+roc_svm_lin <- roc(y_ts, svm_lin_pred)
+
+auc <- c(roc_lr$auc[1], roc_penal_lr$auc[1], 
+         roc_lda$auc[1], roc_nb$auc[1],
+         roc_ctree$auc[1], roc_boost_ctree$auc[1],
+         roc_rf$auc[1], roc_svm_lin$auc[1])
+
+plot(roc_lr, legacy.axes = TRUE)
+plot(roc_penal_lr, col = 2, add = TRUE)
+plot(roc_lda, col = 3, add = TRUE)
+plot(roc_nb, col = 4, add = TRUE)
+plot(roc_ctree, col = 5, add = TRUE)
+plot(roc_boost_ctree, col = 6, add = TRUE)
+plot(roc_rf, col = 7, add = TRUE)
+plot(roc_svm_lin, col = 8, add = TRUE)
+
+model.names <- c("lr", "penal_lr", "lda", "nb",
+                 "ctree", "boost_ctree", "rf", "svml")
+legend("bottomright", legend = paste0(model.names, ": ", round(auc, 3)),
+       col = 1:8, lwd = 2)
+```
+
