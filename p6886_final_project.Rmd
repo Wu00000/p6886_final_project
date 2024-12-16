@@ -38,6 +38,7 @@ select <- dplyr::select
 # Import data
 t2dm_dat_raw <- read_xlsx(here("./data/Type2Diabetes.xlsx"), 
                           range = "Diabetes_Classification!A1:P391") %>% 
+  na.omit() %>% 
   janitor::clean_names()
 
 # Data overview
@@ -152,6 +153,9 @@ t2dm_penal_lr_10cv <- train(x = x_tr, y = y_tr, method = "glmnet",
                             family = "binomial", tuneGrid = tg,
                             trControl = trainControl(method = "cv", number = 10))
 t2dm_penal_lr_10cv$results[which.max(t2dm_penal_lr_10cv$results$Accuracy), ]
+
+# Look at the coefficients for selected model
+predict(t2dm_penal_lr_10cv$finalModel, s = t2dm_penal_lr_10cv$bestTune$lambda, type = "coef")
 ```
 
 ### Linear Discriminant Analysis (LDA)
@@ -287,7 +291,7 @@ summary(res)
 
 #### Test data performance
 
-```{r, out.width="50%"}
+```{r, out.width="60%"}
 # Make predictions
 lr_pred <- predict(t2dm_lr_10cv, newdata = x_ts, type = "prob")[, 2]
 penal_lr_pred <- predict(t2dm_penal_lr_10cv, newdata = x_ts, type = "prob")[, 2]
@@ -321,9 +325,9 @@ plot(roc_boost_ctree, col = 6, add = TRUE)
 plot(roc_rf, col = 7, add = TRUE)
 plot(roc_svm_lin, col = 8, add = TRUE)
 
-model.names <- c("lr", "penal_lr", "lda", "nb",
-                 "ctree", "boost_ctree", "rf", "svml")
+model.names <- c("LR", "Penalized LR", "LDA", "NB",
+                 "C-Tree", "Boosted C-Tree", "RF", "SVMl")
 legend("bottomright", legend = paste0(model.names, ": ", round(auc, 3)),
-       col = 1:8, lwd = 2)
+       col = 1:8, lwd = 2, cex = .7)
 ```
 
